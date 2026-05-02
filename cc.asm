@@ -1525,6 +1525,16 @@ xxx
         call pripony
         jp z,rrrun
 
+        ld hl,cmd2
+        ld de,ext_nxi
+        call pripony
+        jp z,rrrun
+
+        ld hl,cmd2
+        ld de,ext_NXI
+        call pripony
+        jp z,rrrun
+
         ; pokud žádná přípona neodpovídá -> nepodporováno
         jp unsup
 
@@ -1599,6 +1609,17 @@ rrrun
         ld de,ext_bas
         call pripony
         jp z,RUN_BAS
+
+        ; NXI -> .nxiview dot command
+        ld hl,cmd2
+        ld de,ext_nxi
+        call pripony
+        jp z,RUN_NXI
+
+        ld hl,cmd2
+        ld de,ext_NXI
+        call pripony
+        jp z,RUN_NXI
 
         ; fallback -> nic nespouštěj
         jp loop0
@@ -1722,7 +1743,7 @@ RUN_SNAP
         ld   bc,32765
         out  (c),a
 
-        ; připrav příkaz “run     ” do cmd (kopíruje tapein -> cmd)
+        ; připrav příkaz "run     " do cmd (kopíruje tapein -> cmd)
         ld hl,tapein
         ld de,cmd
         ld bc,cmd-tapein
@@ -1733,6 +1754,56 @@ RUN_SNAP
         call spravneStranky
 
         ; zavolej ESXDOS službu $8F s parametry v IX=cmd
+        ld ix,cmd
+        rst $08
+        defb $8f
+        ret
+
+
+        ; ------------------------------------------------------------
+        ; RUN_NXI
+        ; ------------------------------------------------------------
+        ; Spustí nxiview <soubor> přes ESXDOS dot-command (rst $08, $8F).
+        ; Stejný postup jako RUN_SNAP, jen verb je "nxiview" místo "run".
+        ; ------------------------------------------------------------
+RUN_NXI
+        ; přepiš cmd verbem "nxiview " PŘED dialogem,
+        ; aby potvrdMsg vypsal skutečný řádek "<verb> <filename>".
+        ld hl,nxiin
+        ld de,cmd
+        ld bc,cmd-tapein
+        ldir
+
+        ; potvrzovací dialog se zprávou = aktuální cmd ("nxiview <filename>\0")
+        ld de,cmd
+        call potvrdMsg
+
+        call dospage
+        call zapisCfg
+        call basicpage
+        call layer0
+
+        ; obnov sysvars
+        ld de,23296
+        ld hl,sysvars
+        ld bc,500
+        ldir
+
+        ; inicializace systému před návratem do loaderu/ROMu
+        ld   iy,23610
+        ld   hl,10072
+        exx
+        im   1
+        ld   a,63
+        ld   i,a
+        ld   a,16
+        ld   bc,32765
+        out  (c),a
+
+        ; vypni turbo
+        nextreg TURBO_CONTROL_NR_07,0
+        call spravneStranky
+
         ld ix,cmd
         rst $08
         defb $8f
@@ -1895,7 +1966,7 @@ savesp   ld sp,0                                  ; self-modify: obnov původní
         ; ------------------------------------------------------------
         ; RUN_NEX_FILE
         ; ------------------------------------------------------------
-        ; Confirm + ulož cfg + obnov sysvars + zavolej ESXDOS $8F s IX=cmd
+        ; Confirm + ulož cfg + obnov sysvars + zavolej ESXDOS $8F s IX = verb start
         ; ------------------------------------------------------------
 RUN_NEX_FILE
 
@@ -1962,6 +2033,20 @@ spravneStranky
         ; - čeká na Enter nebo klik myší
         ; - pokud No/ESC-like (klávesa==1) -> enterno -> obnov obrazovku a návrat loop0
         ; ------------------------------------------------------------
+        ; potvrdMsg – varianta s vlastní zprávou (DE = nul-terminated text)
+potvrdMsg
+        push de
+        call savescr
+        ld hl,10 * 256 + 10
+        ld bc,60 * 256 + 5
+        ld a,16
+        call window
+        pop de
+        ld hl,11*256+11
+        ld a,16
+        call print
+        jr potvrd_buttons
+
 potvrd
         call savescr                              ; externí: ulož obrazovku
 
@@ -1975,6 +2060,7 @@ potvrd
         ld de,runtxt
         call print
 
+potvrd_buttons
         ; tlačítko YES (barva 48)
         ld hl,60*256+15
         ld a,48
@@ -2117,6 +2203,9 @@ ext_SNA defb ".SNA"
 ext_bas defb ".bas"
 ext_BAS defb ".BAS"
 
+ext_nxi defb ".nxi"
+ext_NXI defb ".NXI"
+
 
 ; ------------------------------------------------------------
 ; Buffery/příkazy pro ESXDOS/BASIC
@@ -2125,7 +2214,12 @@ cmdload defb $ef                                  ; BASIC token LOAD (další ba
 
 cmd3    defs 100                                  ; pomocný buffer
 
-tapein  defb "run     "                           ; text pro příkaz (7 znaků + mezery)
+; Verb buffery — všechny 8B, bez vedoucí tečky ($8F si ji doplní sám stejně
+; jako u "run"/"nexload"). nxiin/tapein jsou zdroje pro LDIR -> cmd; cmd je
+; zároveň statický verb pro RUN_NEX_FILE i kopírovací cíl pro RUN_SNAP/RUN_NXI.
+; cmd2 musí následovat hned za cmd, aby IX=cmd viděl "<verb> <filename>\0".
+nxiin   defb "nxiview "                           ; text pro nxiview (8 znaků včetně mezery)
+tapein  defb "run     "                           ; text pro příkaz (3 + 5 mezer = 8B)
 cmd     defb "nexload "                           ; text pro příkaz (8 znaků včetně mezery)
 cmd2    defs 100                                  ; hlavní buffer pro filename / command
 
