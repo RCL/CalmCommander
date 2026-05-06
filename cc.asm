@@ -1763,8 +1763,14 @@ RUN_SNAP
         ; ------------------------------------------------------------
         ; RUN_NXI
         ; ------------------------------------------------------------
-        ; Spustí nxiview <soubor> přes ESXDOS dot-command (rst $08, $8F).
-        ; Stejný postup jako RUN_SNAP, jen verb je "nxiview" místo "run".
+        ; Spustí nxiview <soubor> přes ESXDOS dot-command ($8F).
+        ; Na rozdíl od RUN_SNAP/RUN_NEX_FILE se NEpředává řízení do BASICu —
+        ; .nxiview je VIEWER, vrátí se. Proto:
+        ;   1) uložíme NextReg stav CC
+        ;   2) zavoláme $8F (paging pro ESXDOS zařídí dospage)
+        ;   3) obnovíme NextRegy (MMU regy první! viz tabulka)
+        ;   4) přehrajeme reg-sekvence (clip-tilemap, paleta) které tier 1 nemůže
+        ;   5) překreslíme obrazovku a vrátíme se do hlavní smyčky
         ; ------------------------------------------------------------
 RUN_NXI
         ; přepiš cmd verbem "nxiview " PŘED dialogem,
@@ -1778,35 +1784,161 @@ RUN_NXI
         ld de,cmd
         call potvrdMsg
 
-        call dospage
-        call zapisCfg
-        call basicpage
-        call layer0
+        ; --- 1) Uložit NextReg stav CC (port-based, paging-independent) ---
+        call SaveNextRegState
 
-        ; obnov sysvars
+        ; --- 2) Uložit CC's pohled na 23296+ (500B) ---
+        ; CC tam má svoje data; ESXDOS chce mít na 23296 BASIC sysvars.
+        ld hl,23296
+        ld de,ccSysvarsSave
+        ld bc,500
+        ldir
+
+        ; --- 3) Standardní ESXDOS preamble (kopie z RUN_NEX_FILE, který funguje) ---
+        call layer0
+        call dospage
+        call basicpage
+
+        ; obnov BASIC sysvars na 23296 (potřebné pro ESXDOS volání)
         ld de,23296
         ld hl,sysvars
         ld bc,500
         ldir
 
-        ; inicializace systému před návratem do loaderu/ROMu
-        ld   iy,23610
-        ld   hl,10072
-        exx
-        im   1
-        ld   a,63
-        ld   i,a
-        ld   a,16
-        ld   bc,32765
-        out  (c),a
-
-        ; vypni turbo
-        nextreg TURBO_CONTROL_NR_07,0
+        call layer0
         call spravneStranky
 
+        ; --- 4) Spustit dot command ---
         ld ix,cmd
         rst $08
         defb $8f
+
+        ; --- 5) Obnovit NextRegy CC PŘED jakýmkoliv přístupem do bankovaných
+        ; oblastí. Tabulka má MMU $50-$57 na začátku, takže během prvních 8
+        ; iterací loop CC získá zpět svůj memory map. RestoreNextRegState
+        ; sám čte jen tabulku+buffer v bank-5-upper, je bezpečný i s rozhozenou
+        ; MMU paginací. ---
+        call RestoreNextRegState
+
+        ; --- 6) Obnovit CC's data na 23296+ ze ccSysvarsSave (S3 / $A000+).
+        ; Teď už $54/$55 obnovené, takže LDIR z ccSysvarsSave funguje. ---
+        ld de,23296
+        ld hl,ccSysvarsSave
+        ld bc,500
+        ldir
+
+        ; --- 7) Přehrát clip-tilemap a paletu (Tier 2) ---
+        call ReplayVideoInit
+
+        ; --- 8) Znovu nahrát sprite patterns (spravneStranky volá
+        ; ClearAllSprites/ClearSpritePatterns, takže patterns jsou prázdné) ---
+        call LoadSprites
+
+        ; --- 9) Překreslit hlavní obrazovku CC ---
+        call kresli
+        jp loop0
+
+
+        ; ------------------------------------------------------------
+        ; SaveNextRegState / RestoreNextRegState / ReplayVideoInit
+        ; ------------------------------------------------------------
+        ; Použité pro round-trip do .nxiview (viz RUN_NXI).
+        ; Důležité: tabulka i buffer i kód musí ležet ve hlavní stránce CC
+        ; (bank 5 upper, $6000-$7FFF), jinak by je nešlo přečíst po návratu
+        ; z dot-commandu, dokud nejsou MMU regy obnovené.
+        ; savedRegList je SEŘAZENÝ — MMU $50-$57 jsou na začátku, takže během
+        ; restore loopu se memory-map CC obnoví dřív než cokoliv co by sahalo
+        ; do bankovaných oblastí.
+        ; ------------------------------------------------------------
+savedRegList:
+        ; MMU first — restore order matters
+        defb $50, $51, $52, $53, $54, $55, $56, $57
+        ; ostatní (pořadí libovolné)
+        defb $07, $08, $15, $19, $2F, $30, $31, $34, $3B
+        defb $40, $43, $4A, $4C, $68, $69, $6B, $6C, $6E, $6F
+savedRegList_END
+SAVED_REG_COUNT equ savedRegList_END - savedRegList
+savedRegBuf:
+        defs SAVED_REG_COUNT
+
+        ; Pozn.: ccSysvarsSave (500B) leží v části 2 (S3, $A000+), aby se vešel
+        ; do binárky bez overflow první části. RUN_NXI ho čte AŽ po
+        ; RestoreNextRegState, takže $54/$55 jsou v té chvíli již obnovené.
+
+; --- Locality assert: round-trip restore kód+data musí ležet v bank 5 upper
+; ($6000-$7FFF), aby zůstaly mapované po návratu z $8F bez ohledu na to, co
+; .nxiview udělala s $53. (RUN_NXI's `call RestoreNextRegState` skočí sem;
+; pokud bychom se přelili nad $8000, instrukce v $8XXX-$BXXX závisí na
+; $54/$55, které dot-command běžně přepíše.)
+roundtripRestoreEnd:
+        ASSERT  RUN_NXI            >= $6000
+        ASSERT  roundtripRestoreEnd <  $8000
+
+SaveNextRegState:
+        ld bc,SAVED_REG_COUNT
+        ld hl,savedRegList
+        ld de,savedRegBuf
+.loop
+        ld a,(hl)                                 ; reg #
+        push bc
+        push hl
+        push de
+        call ReadNextReg2A                        ; A = value (cc.asm @196)
+        pop de
+        pop hl
+        pop bc
+        ld (de),a
+        inc hl
+        inc de
+        dec bc
+        ld a,b
+        or c
+        jr nz,.loop
+        ret
+
+RestoreNextRegState:
+        ld bc,SAVED_REG_COUNT
+        ld hl,savedRegList
+        ld de,savedRegBuf
+.loop
+        ld a,(hl)                                 ; reg #
+        push bc
+        ld bc,$243B
+        out (c),a                                 ; vyber NextReg index
+        ld a,(de)                                 ; hodnota
+        ld bc,$253B
+        out (c),a                                 ; zapiš
+        pop bc
+        inc hl
+        inc de
+        dec bc
+        ld a,b
+        or c
+        jr nz,.loop
+        ret
+
+ReplayVideoInit:
+        ; clip-tilemap: $1B je sériově-zápisový (4 writes nastaví L,R,T,B).
+        ; Tier 1 to nemůže rekonstruovat — restore přepíše jen jeden bajt.
+        nextreg CLIP_TILEMAP_NR_1B,0
+        nextreg CLIP_TILEMAP_NR_1B,159
+        nextreg CLIP_TILEMAP_NR_1B,0
+        nextreg CLIP_TILEMAP_NR_1B,255
+
+        ; paleta: $44 je write-port (data se zapisují podle aktuálního $40).
+        ; Replay nahraje celou tilemapPalette stejně jako startup CC.
+        nextreg PALETTE_CONTROL_NR_43,%0'011'0000 ; tilemap pal0
+        nextreg PALETTE_INDEX_NR_40,0
+        ld hl,tilemapPalette
+        ld bc,tilemapPalette_SZ
+.setPalLoop
+        ld a,(hl)
+        inc hl
+        nextreg PALETTE_VALUE_9BIT_NR_44,a
+        ld a,b
+        or c
+        dec bc
+        jr nz,.setPalLoop
         ret
 
 
@@ -4135,6 +4267,10 @@ FILEBUFF
 
 E1
 
+        ; First-part overflow guard: pokud RUN_NXI/Save/Restore/buffery vyrostou
+        ; nad $A000, předchozí kód se přelije do S3 a tichý overlap rozbije binárku.
+        ASSERT  E1 <= $A000
+
         org $a000
 S3
         include "functions/copy.asm"
@@ -4145,6 +4281,14 @@ S3
         include "functions/input.asm"
 tilemapFont_char24:
         include "tilemap_font_8x6.i.asm"
+
+        ; ccSysvarsSave žije v S3 (volné místo > 3K). Čte se až po
+        ; RestoreNextRegState, takže $54/$55 jsou v té chvíli obnovené.
+ccSysvarsSave:
+        defs 500
+ccSysvarsSave_END:
+        ASSERT  ccSysvarsSave_END <= $C000   ; nesmí přesáhnout S3 do S2
+
 E3
         org 49152
 S2
